@@ -35,3 +35,48 @@ class Dealer(models.Model):
 
     def __str__(self):
         return self.dealer_code
+class Order(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT"
+        CONFIRMED = "CONFIRMED"
+        DISPATCHED = "DISPATCHED"
+        DELIVERED = "DELIVERED"
+        CANCELLED = "CANCELLED"
+
+    order_number = models.CharField(max_length=20, unique=True)
+    dealer = models.ForeignKey(Dealer, on_delete=models.PROTECT, related_name="orders")
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.DRAFT, db_index=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.order_number
+
+
+class OrderItem(models.Model):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="items")
+    product = models.ForeignKey(Product, on_delete=models.PROTECT)
+    quantity = models.PositiveIntegerField()
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.UniqueConstraint(fields=["order", "product"], name="uniq_order_product")
+        ]
+
+
+class OrderSequence(models.Model):
+    """One row per day. last_number is the last order number used that day."""
+
+    date = models.DateField(unique=True)
+    last_number = models.PositiveIntegerField(default=0)
+
+
+class IdempotencyRecord(models.Model):
+    key = models.CharField(max_length=255, unique=True)
+    request_hash = models.CharField(max_length=64)
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)

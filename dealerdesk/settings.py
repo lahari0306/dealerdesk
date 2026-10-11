@@ -82,6 +82,8 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
     "UNAUTHENTICATED_USER": None,
+    "EXCEPTION_HANDLER": "core.errors.api_exception_handler",
+    "DEFAULT_PAGINATION_CLASS": "core.pagination.StandardPagination",
 }
 
 # ---- Assignment settings --------------------------------------------------------------
