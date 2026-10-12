@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import order_views, views
+from . import order_views, sync, views
 
 urlpatterns = [
     path("health/", views.health),
@@ -15,4 +15,5 @@ urlpatterns = [
     path("orders/<str:order_number>/dispatch/", order_views.OrderAction.as_view(action="dispatch")),
     path("orders/<str:order_number>/deliver/", order_views.OrderAction.as_view(action="deliver")),
     path("orders/<str:order_number>/cancel/", order_views.OrderAction.as_view(action="cancel")),
+    path("sync/supplier/", sync.SupplierSync.as_view()),
 ]
