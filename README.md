@@ -1,41 +1,44 @@
-# DealerDesk starter
+# DealerDesk
 
-A minimal Django project that already follows the run contract. It has **no models and no business logic**: designing those is the assignment.
+**Track: django**
 
-What's here:
+Dealer ordering backend (Django + DRF + PostgreSQL) with a strict order engine and a supplier sync.
 
-- `dealerdesk/settings.py` reads `DATABASE_URL`, `SUPPLIER_API_URL`, `SUPPLIER_API_KEY` and the LLM keys (Gemini, OpenAI, Anthropic, Groq), refuses anything but PostgreSQL, and turns off authentication for the API.
-- `GET /api/health/` returns `{"status": "ok"}`.
-- `python manage.py seed_data` exists but does nothing yet.
-- `requirements.txt` with Django, DRF, the Postgres driver and `requests`. Add your LLM provider's SDK if you build the assistant.
+## What is built
+- A1 Backend core: products, inventory, dealers, draft orders, one error format
+- A2 Order engine: status flow, no overselling, exact GST, order numbers, idempotency
+- B Supplier sync: `POST /api/sync/supplier/`
+- Optional parts (assistant, forecasting, frontend): **not attempted**
 
-## Set up
-
-1. Copy everything in this folder into the root of your repo, next to `data/`.
-2. Get a PostgreSQL database:
-   - **Hosted, free:** create a project on neon.tech or supabase.com and copy its connection string, or
-   - **Local:** install PostgreSQL and run `createdb dealerdesk`.
-3. Copy `.env.example` to `.env` and fill in `DATABASE_URL` (and your LLM key if you build the assistant).
-4. Install and run:
-
+## Setup
 ```bash
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python manage.py migrate
+cp .env.example .env               # then set DATABASE_URL (PostgreSQL), SUPPLIER_API_URL, SUPPLIER_API_KEY
+python manage.py migrate --noinput
 python manage.py seed_data
-python manage.py runserver 0.0.0.0:8000
+python manage.py seed_data         # safe to run twice
+python manage.py runserver 0.0.0.0:8000 --noreload
 ```
 
-5. Check it: `curl http://localhost:8000/api/health/` → `{"status": "ok"}`
-
-## Before you submit
-
-Reset to a fresh database, seed twice, and run the smoke test from the bundle:
-
+## Run the tests
 ```bash
-python smoke_test.py --base-url http://localhost:8000 --track django   # or --track aiml
+python manage.py test
+```
+The database user needs permission to create a test database. Tests use PostgreSQL, as SQLite is not supported.
+
+Smoke test (server running, mock supplier running):
+```bash
+python supplier_mock/mock_supplier.py
+python smoke_test.py --base-url http://localhost:8000 --track django
 ```
 
-Add new packages to `requirements.txt` as you go. The grader installs it on Linux with Python 3.11+.
+## Assumptions
+- GST is 18% per line, rounded `ROUND_HALF_UP` to the paisa. Order dates use IST.
+- Products created by the supplier sync start with stock 0. The sync never changes stock of existing products.
+- A DRAFT follows the current catalogue price. The price is locked on confirm.
 
-Docker is optional. If you add a `Dockerfile` or `docker-compose.yml` for yourself, keep the plain commands above working too: the grader uses those, not Docker.
+## Links
+- Video walkthrough: **ADD YOUR LINK HERE**
+- Design decisions: [DECISIONS.md](DECISIONS.md)

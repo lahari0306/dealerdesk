@@ -1,59 +1,43 @@
-# DECISIONS
+# DECISIONS (Django track)
 
-## 1. Where is overselling prevented?
-core/orders.py:218-243 (`apply_action`) runs inside `transaction.atomic`. It locks the
-order row (line 225), then `take_stock` (line 176) calls `lock_inventory` (lines 165-173),
-which uses `select_for_update()` on the Inventory rows, sorted by product_id. The stock
-check (lines 180-197) and the deduction (lines 199-204) happen while those locks are held.
-Without the lock, two confirms arriving together would both read "5 available", both pass the
-check, and both deduct, so stock would go negative and two dealers would be promised the same
-units. With the lock, the second request waits, then reads the reduced stock and gets
-409 INSUFFICIENT_STOCK. Sorting by product_id means two orders always lock rows in the same
-order, so they cannot deadlock.
+## 1. Where exactly is overselling prevented?
+`core/orders.py:218-243` (`apply_action`) runs in `transaction.atomic`. Line 225 locks the order row with `select_for_update()`. For a confirm, line 237 calls `take_stock` (`orders.py:176-204`), which calls `lock_inventory` (`orders.py:165-173`). That locks the Inventory rows with `select_for_update()`, sorted by `product_id`. The stock check (lines 180-197) and the deduction (lines 199-204) both happen while those row locks are held.
 
-## 2. GST and rounding
-core/orders.py:13-19 and the loop in `serialize_order`. Money uses `Decimal`, never float.
-`money()` rounds with `ROUND_HALF_UP`. Tax is rounded per line (line_subtotal * 0.18), then
-summed. Floats cannot represent values like 0.1 exactly, so totals drift by a paisa.
-Decimal's default rounding is ROUND_HALF_EVEN, which turns 0.005 into 0.00 instead of 0.01.
+Without the lock, two confirms arriving together would both read "5 available", both pass the check, and both subtract, so stock goes negative and two dealers are promised the same units. With the lock, the second request waits until the first commits, then reads the reduced quantity and gets `409 INSUFFICIENT_STOCK`. Sorting by `product_id` means two orders always lock rows in the same order, so they cannot deadlock.
 
-## 3. How are duplicate order requests handled?
+## 2. How do you calculate and round GST?
+`core/orders.py:13-19` defines `GST_RATE = Decimal("0.18")` and `money()`, which uses `quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)`. In `serialize_order` (`orders.py:127-128`), the line subtotal is `money(unit_price * quantity)` and the line tax is `money(line_subtotal * GST_RATE)`. Tax is rounded per line, then the lines are summed (`orders.py:129-130`). Totals are recomputed from the lines on every read, so they cannot go stale.
 
-`core/order_views.py`, `OrderListCreate.post()` and `replay()` implement idempotency using the `Idempotency-Key` request header. The request body is hashed using `request_hash()`. If a key already exists with the same request hash, the existing order is returned with HTTP 200 instead of creating a duplicate. If the same key is reused with a different body, the API returns HTTP 409 with `IDEMPOTENCY_CONFLICT`.
+Floats cannot store values like 0.1 exactly, so sums drift by a paisa. Decimal's default rounding is `ROUND_HALF_EVEN`, so 0.045 would become 0.04 instead of the required 0.05.
 
-For concurrent requests, the code creates an `IdempotencyRecord` inside `transaction.atomic()`. The database unique constraint on the key ensures that only one record can be created for a given key. If a concurrent request violates this constraint, `IntegrityError` is caught and the existing record is replayed. The record and order are created in the same transaction, so a failed order creation also rolls back the idempotency record.
+## 3. Unique order numbers and idempotent creation under simultaneous requests
+**Order numbers:** `next_order_number()` (`orders.py:76-84`) keeps one row per IST day in `OrderSequence` (`models.py:71-75`, `date` is unique). Line 79 creates the row if missing. Line 81 reads it with `select_for_update()`, so parallel requests queue up. Line 82 increments the counter before the number is formatted on line 84. It is called inside `create_draft`, which is `@transaction.atomic` (`orders.py:87-89`). Because the lock is held until commit, two orders can never receive the same number. `Order.order_number` is also `unique=True` (`models.py:46`) as a second guard.
 
-## 4. Explain your schema and relationships
+**Idempotency:** `OrderListCreate.post` (`order_views.py:44-74`). `IdempotencyRecord.key` is unique at the database level (`models.py:79`). Line 63 inserts the record inside the same transaction as the order (lines 58-67). If two identical requests arrive together, the second insert waits for the first to commit, then fails with `IntegrityError`. The `except` at lines 68-72 catches it and replays the stored order instead of creating a second one. The pre-check at lines 49-52 is only a fast path; the unique constraint is what actually guarantees one order. `replay` (`order_views.py:76-83`) compares the SHA-256 hash of the body (`orders.py:26-28`) and returns 200 with the same order, or `409 IDEMPOTENCY_CONFLICT` if the same key arrives with a different body. Because the record and the order are saved in one transaction, a failed order leaves no orphan record.
 
-`core/models.py` defines the database schema.
+## 4. Schema and `on_delete` choices (`core/models.py`)
+- **Product** (line 4): `sku` unique, `price` is a `DecimalField`, `category` is indexed.
+- **Inventory** (line 17): one-to-one with Product, `CASCADE` (line 19). Stock has no meaning without its product.
+- **Dealer** (line 27): `dealer_code` unique.
+- **Order** (line 38): `dealer` is a ForeignKey with `PROTECT` (line 47), so a dealer who has orders cannot be deleted and history stays intact. `status` is indexed. `order_number` is unique.
+- **OrderItem** (line 58): `order` uses `CASCADE` (line 59), because lines belong to their order. `product` uses `PROTECT` (line 60), so a product that appears in an order cannot be deleted. `unit_price` stores the price at confirm time. A unique constraint on `(order, product)` (line 67) stops duplicate lines.
+- **OrderSequence** (line 71): the per-day counter, `date` unique.
+- **IdempotencyRecord** (line 78): `key` unique. `order` is a ForeignKey with `CASCADE` and `null=True` (line 81), so the record can be created before the order exists and is removed with the order.
 
-- **Product:** Stores SKU, name, category, brand, vehicle fitment, description and decimal price. SKU is unique to prevent duplicate product identifiers.
-- **Inventory:** Has a one-to-one relationship with Product. `CASCADE` deletes inventory when its product is deleted because that stock record is no longer needed.
-- **Dealer:** Stores dealer details, unique dealer code and decimal credit limit.
-- **Order:** Belongs to a Dealer through a foreign key using `PROTECT`. This prevents deleting a dealer who has orders.
-- **OrderItem:** Belongs to an Order using `CASCADE`, so deleting an order deletes its line items. Its Product foreign key uses `PROTECT`, preventing deletion of products referenced by order history. A unique constraint on `(order, product)` prevents duplicate product lines in an order.
-- **OrderSequence:** Stores the last order number used for each date. Its unique date constraint supports unique daily order-number generation.
-- **IdempotencyRecord:** Stores a unique request key, request hash and associated order. Its order foreign key uses `CASCADE` with `null=True`, so deleting the order also deletes its idempotency record.
+## 5. Where are status transitions enforced, and how does cancel restore stock exactly once?
+Transitions are defined in the `ACTIONS` table (`orders.py:157-162`) and enforced in `apply_action` (`orders.py:229-234`): if the current status is not in the allowed set, it raises `409 INVALID_TRANSITION`. Views only call `apply_action` (`order_views.py:97-101`), so there is no other path that changes status.
 
-These relationships preserve referential integrity, protect order history from accidental deletion, and keep related records consistent.
+Line 225 locks the order row first. A second cancel for the same order waits there, then sees the new status `CANCELLED` and is rejected at line 229, so line 239 (`give_stock_back`, `orders.py:207-215`) runs only once. Cancelling a DRAFT never touches stock (line 238 only restores for CONFIRMED). The status change and the stock change are in the same transaction, so they succeed or fail together.
 
+## 6. Supplier sync: rate limits, failures, duplicates, and changing nothing on failure
+`fetch_page` (`core/sync.py:24-63`) tries each request at most 5 times (`MAX_ATTEMPTS`, line 14). On `429` it sleeps for `Retry-After`, capped at 20 seconds (lines 48-53). On `5xx` or a connection error it sleeps a short backoff (lines 34, 54-55, 60-61). On `401` or any other client error it fails immediately with `502 SUPPLIER_UNAVAILABLE` (lines 56-58), because retrying cannot help. After 5 failed attempts it raises the same 502 (line 63). `fetch_everything` (`sync.py:66-78`) follows `next_cursor` through every page and stops with a 502 if a cursor repeats (line 76).
 
-## 5. Where are status transitions enforced, and how is stock restored exactly once?
+All pages are downloaded in memory at line 108, and the database is not touched until that succeeds. The writes happen in one `transaction.atomic()` block (line 133), so a fetch failure changes nothing, and a database error rolls everything back. Invalid items (missing sku, bad price) are skipped and reported in `rejected` (lines 113-124). Duplicate SKUs are resolved by keeping the item with the newest `updated_at` (lines 126-129).
 
-`core/orders.py`, lines containing `ACTIONS` and `apply_action()`, define and enforce valid status transitions. The allowed flow is DRAFT → CONFIRMED → DISPATCHED → DELIVERED. DRAFT and CONFIRMED orders can be cancelled. Any other transition raises `ApiError` with HTTP 409 and `INVALID_TRANSITION`.
+## 7. How does the sync decide created, updated or unchanged, and why does a second run change nothing?
+`run_sync` loads existing products for the SKUs in one query (`sync.py:134`). A SKU not in the database goes to `to_create` (lines 141-143). Otherwise each supplier field is compared with the database value (line 144). If any field differs, only those fields are set and the product goes to `to_update` (lines 145-148). If nothing differs, it counts as unchanged (line 150). New products get an Inventory row with quantity 0 (lines 154-156). `bulk_update` only touches product fields (`UPDATE_FIELDS`, line 157), so the stock of existing products is never changed.
 
-`apply_action()` runs inside `transaction.atomic()` and locks the order row using `select_for_update()`. When confirming, `take_stock()` locks inventory rows in product ID order, checks all requested quantities before deducting anything, and raises `INSUFFICIENT_STOCK` if stock is insufficient. When cancelling a CONFIRMED order, `give_stock_back()` restores the quantities. The order lock ensures a second concurrent cancellation waits, then sees CANCELLED and is rejected, preventing stock from being restored twice. The transaction keeps stock changes and the status update together.
+On a second run the supplier values equal what is already stored (price is compared as `Decimal`, text as `str`), so every product is unchanged, and `created` and `updated` are both 0.
 
-## 6. How does supplier sync handle rate limits, failures, duplicates, and atomicity?
-
-`core/sync.py`, `fetch_page()` retries failed requests up to 5 times. For HTTP 429, it respects the `Retry-After` header, capped at 20 seconds. Server errors and request exceptions use a short backoff. Unrecoverable client errors raise `SUPPLIER_UNAVAILABLE` with HTTP 502. `fetch_everything()` downloads every page before any database writes and rejects repeating cursors to avoid infinite loops. Therefore, a fetch failure leaves the database unchanged. After fetching, `run_sync()` validates items and prices, keeps the newest version for each SKU, and performs all database writes inside `transaction.atomic()`, so a database failure rolls back the sync changes.
-
-
-## 7. How does sync decide created, updated, and unchanged?
-
-`core/sync.py`, `run_sync()`, compares each valid supplier product with the existing product having the same SKU. A missing SKU is created with its supplied fields and price, and a new Inventory record is initialized with quantity 0. If an existing product has changed values, only those fields are updated and the product is counted as updated. If no compared fields differ, it is counted as unchanged. Duplicate supplier entries for the same SKU are reduced to the entry with the newest `updated_at` timestamp before writing. Because unchanged products are not saved, and existing inventory quantities are never modified, a second identical sync should report existing products as unchanged and leave their stock untouched.
-
-
-## 8. What is the weakest part of my submission, and what would I improve with two more days?
-
-The weakest part of my submission is the limited verification of edge cases beyond the supplied smoke test. With two more days, I would add automated tests for concurrent order confirmations, simultaneous idempotent requests, cancellation and stock restoration, supplier rate limits and outages, duplicate supplier records, and repeated syncs. I would also improve logging and document the setup and testing process so the application is easier to maintain and verify.
+## 8. Weakest part, and what I would do with two more days
+The weakest part is verification. The only automated tests are a small set in `core/tests.py` (GST rounding, stock, cancel, price lock, idempotency). I have not written a true concurrency test that fires many confirms at the same moment with threads. `seed_data` (`core/management/commands/seed_data.py:19-34`) also uses `update_or_create` and `get_or_create` row by row, which issues several queries per product (a few thousand in total) and is slow on a remote database. With two more days I would add a threaded concurrency test for confirm and idempotent create, convert the seed to `bulk_create` with conflict handling, add sync tests against the mock supplier (rate limits, outage, duplicates), and add logging. I did not attempt the optional parts (assistant, forecasting, frontend).
