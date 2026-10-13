@@ -40,5 +40,5 @@ python smoke_test.py --base-url http://localhost:8000 --track django
 - A DRAFT follows the current catalogue price. The price is locked on confirm.
 
 ## Links
-- Video walkthrough: **ADD YOUR LINK HERE**
+- Video walkthrough: https://drive.google.com/file/d/137hyQvbAcHsukF6du3hcA-0i5vcIGURh/view?usp=sharing
 - Design decisions: [DECISIONS.md](DECISIONS.md)
